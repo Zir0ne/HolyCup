@@ -1,0 +1,305 @@
+/*
+    坏狗是交易系统的MT平台脚本, 是的, 坏狗会按照莉芮尔的指令去做, 但有时候它也会不那么听话, 尤其...网络繁忙的时候
+    简单来说, 坏狗就是一个交易指令的执行者. 坏狗会将它观察到的市场的每一次变化都告诉它的主人: 莉芮尔, 接收莉芮尔的
+    交易指令后, 坏狗会按照指令去执行. 循环往复.
+
+    body自然是坏狗的主体啦, 在我之前写过的MQL4脚本基础上修改而成, 该脚本已经过了较多测试, 比较稳定. TCP通信使用
+    zeromq库, 这是一个支持多语言应用通信的库, 热度也很高, 值得使用
+
+    注意事项:
+    1. 一个New Ticket事件没有处理完毕之前, 下一个ticket事件不会触发, 因此, 快速的处理ticket事件很关键. 由于
+       坏狗和莉芮尔之间通过TCP通信, 要妥善的处理好TCP通信可能导致的延迟, 例如, 网络不通等情况
+    2.
+*/
+
+#property copyright "Copyright 2012, Zir0ne."
+#property link      "zir0ne@outlook.com"
+
+#include <OTMql4Zmq.mqh>
+
+
+// 输入参数, 这些会显示在EA的配置界面上, 属于人工可以干预的参数
+extern double POINT_VALUE           = 0.00001;	   // 点位， 福汇的十分之一点
+extern int    MAX_EFFICIENT_BAR_LEN = 200;		   // 如果一个蜡烛的长度超过这个点数，制定交易决策时不考虑该蜡烛
+extern int    EFFICIENT_WAVE_SPAN   = 400;		   // 一个活跃波的跨度至少要达到这个值
+extern int    TRADE_MAX_LOST_POINT  = 500;		   // 可允许的单笔订单的最大损失点数
+extern int    SLIPPAGE              = 50;          // 允许的滑点数量
+
+
+// 全局变量
+       double dActionBuf[161];                     // 10个预留传值位，1个订单个数指示位，30个订单传值位
+       double dInitBuf[11];
+         bool bInitSucceed = false;                // 初始化成功的标志
+          int hRecordFile;
+
+
+//--- init function
+int init()
+{
+    // 初始化zeromq的context, context实际上是一个void*指针, 因为mql4不支持指针类型, 因此用int代替
+    int context = zmq_ctx_new();
+
+//--- init action buf
+   ArrayInitialize(dActionBuf, 0);
+//--- format init buf
+   int iOrdersNum = FormatInitBuf(OrdersTotal());
+   if (iOrdersNum == -1)
+      return (0);
+//--- init output file
+   hRecordFile = FileOpen("mtRecord.csv", FILE_CSV | FILE_WRITE, ',');
+   if (hRecordFile == -1)
+      return (0);
+//--- call import init function
+   if (0 != TradingInit(dInitBuf))
+      return (0);
+//--- return
+   bInitSucceed = true;
+   return(0);
+}
+
+//--- deinit function
+int deinit()
+{
+   return(0);
+}
+
+//--- start function
+int start()
+{
+   if (bInitSucceed == false)
+   {
+      Alert("Cannot initialize trading environment. Please check above tips.");
+      return (0);
+   }
+// refresh account and indicator information
+   dActionBuf[0] = AccountFreeMargin();
+   dActionBuf[9] = iRSI(NULL, PERIOD_D1, 14, PRICE_CLOSE, 0);
+// transfer action buf handle result and get new action
+   double dBars[][6];
+   int iBarsNum = ArrayCopyRates(dBars, Symbol(), PERIOD_M5);
+   MakeTradingDecision(dBars, iBarsNum, HandleActionBuf(dActionBuf), dActionBuf);
+// wait for next tick
+   return (0);
+}
+
+//--- sub functions
+int HandleActionBuf(double dActionBuf[])
+{
+//--- no action
+   if (dActionBuf[10] == 0)
+      return (0);
+//--- handle action
+   for (int i = 0; i < dActionBuf[10]; i++)
+   {
+      //--- already handled
+      if (dActionBuf[i * 5 + 15] != 0)
+         continue;
+      //--- not handled
+      if (dActionBuf[i * 5 + 12] == 0) //开仓
+      {
+         while (!IsTradeAllowed())
+            Sleep(5000);
+         RefreshRates();
+         if (false == HandleOrderOpen(i))
+            return (1);
+      }
+      else                             //平仓
+      {
+         while (!IsTradeAllowed())
+            Sleep(5000);
+         RefreshRates();
+         if (false == HandleOrderClose(i, dActionBuf[i * 5 + 11]))
+            return (1);
+      }
+   }
+//--- return
+   return (0);
+}
+
+int FormatInitBuf(int iOrdersNum)
+{
+   bool   bOrderTypeConfirm = false;
+   int    iOrderType, iRecordOrdersNum = 0;
+
+   ArrayResize(dInitBuf, 10 + 1 + 4 * iOrdersNum);
+
+   for (int i = 0; i < iOrdersNum; i++)
+   {
+      if (OrderSelect(i, SELECT_BY_POS) == false)
+         return (-1);
+      else
+      {
+         if (bOrderTypeConfirm == false)
+         {
+            iOrderType = OrderType();
+            if (OrderSymbol() == Symbol() && (iOrderType == OP_BUY || iOrderType == OP_SELL))
+               bOrderTypeConfirm = true;
+         }
+         if (bOrderTypeConfirm == true)
+         {
+            if ((OrderType() == OP_BUY || OrderType() == OP_SELL) && OrderSymbol() == Symbol())
+            {
+               if (iOrderType != OrderType())
+               {
+                  Alert("Order Type Conflict. You must have Buy and Sell order in ", Symbol());
+                  return (-1);
+               }
+               else
+               {
+                  dInitBuf[i * 4 + 11] = OrderTicket();
+                  dInitBuf[i * 4 + 12] = OrderOpenPrice();
+                  dInitBuf[i * 4 + 13] = OrderLots();
+                  dInitBuf[i * 4 + 14] = OrderType();
+                  iRecordOrdersNum++;
+               }
+            }
+         }
+      }
+   }
+
+   dInitBuf[ 0] = POINT_VALUE;
+   dInitBuf[ 1] = MAX_EFFICIENT_BAR_LEN;
+   dInitBuf[ 2] = EFFICIENT_WAVE_SPAN;
+   dInitBuf[ 3] = TRADE_MAX_LOST_POINT;
+   dInitBuf[10] = iRecordOrdersNum;
+
+   return (iRecordOrdersNum);
+}
+
+int CloseOrder(int index, int ticket, int slippage)
+{
+//--- try to close
+   bool bCloseResult;
+   if (dActionBuf[index * 5 + 13] == 0)
+      bCloseResult = OrderClose(ticket, dActionBuf[index * 5 + 14], Bid, slippage);
+   else
+      bCloseResult = OrderClose(ticket, dActionBuf[index * 5 + 14], Ask, slippage);
+//--- handle close result
+   if (bCloseResult == true)
+   {
+      if (OrderSelect(ticket, SELECT_BY_TICKET) == true)
+      {
+         dActionBuf[index * 5 + 15] = OrderClosePrice();
+         return (0);
+      }
+      else
+         return (1);
+   }
+   else
+      return (2);
+//--- return
+   return (0);
+}
+
+bool HandleOrderClose(int index, int ticket)
+{
+//--- try to close order
+   int nCloseResult = CloseOrder(index, ticket, SLIPPAGE);
+   if (nCloseResult == 0)
+      return (true);
+//--- close fail
+   int nErrorCode = GetLastError();
+   if (nCloseResult == 1)
+   {
+      Alert("Error when close order selection: ", nErrorCode);
+      FileWrite(hRecordFile, "Error when close order selection: ", nErrorCode);
+   }
+   if (nCloseResult == 2)
+   {
+      switch (nErrorCode)
+      {
+      case 138 :
+         RefreshRates();
+         nCloseResult = CloseOrder(index, ticket, SLIPPAGE + 50);
+         if (nCloseResult == 0)
+            return (true);
+         nErrorCode = GetLastError();
+         if (nCloseResult == 1)
+         {
+            Alert("Error when close order selection: ", nErrorCode);
+            FileWrite(hRecordFile, "Error when close order selection: ", nErrorCode);
+         }
+         if (nCloseResult == 2)
+         {
+            Alert("Error when close order repeat: ", nErrorCode);
+            FileWrite(hRecordFile, "Error when close order repeat: ", nErrorCode);
+         }
+         return (false);
+      default :
+         Alert("Error when close order: ", nErrorCode);
+         FileWrite(hRecordFile, "Error when close order: ", nErrorCode);
+         return (false);
+      }
+   }
+   return (true);
+}
+
+int OpenOrder(int index, int slippage)
+{
+//--- try to open
+   int nResult;
+   if (dActionBuf[index * 5 + 13] == 0)
+      nResult = OrderSend(Symbol(), OP_BUY,  dActionBuf[index * 5 + 14], Ask, slippage, 0, 0);
+   else
+      nResult = OrderSend(Symbol(), OP_SELL, dActionBuf[index * 5 + 14], Bid, slippage, 0, 0);
+//--- handle open result
+   if (nResult >= 0)
+   {
+      if (OrderSelect(nResult, SELECT_BY_TICKET) == true)
+      {
+         dActionBuf[index * 5 + 15] = OrderOpenPrice();
+         dActionBuf[index * 5 + 11] = nResult;
+         dActionBuf[index * 5 + 14] = OrderLots();
+         return (0);
+      }
+      else
+         return (1);
+   }
+   else
+      return (2);
+
+   return (0);
+}
+
+bool HandleOrderOpen(int index)
+{
+//--- try to open order
+   int nOpenResult = OpenOrder(index, SLIPPAGE);
+   if (nOpenResult == 0)
+      return (true);
+//--- open fail
+   int nErrorCode = GetLastError();
+   if (nOpenResult == 1)
+   {
+      Alert("Error when open order selection: ", nErrorCode);
+      FileWrite(hRecordFile, "Error when open order selection: ", nErrorCode);
+   }
+   if (nOpenResult == 2)
+   {
+      switch (nErrorCode)
+      {
+      case 138 :
+         RefreshRates();
+         nOpenResult = OpenOrder(index, SLIPPAGE + 50);
+         if (nOpenResult == 0)
+            return (true);
+         nErrorCode = GetLastError();
+         if (nOpenResult == 1)
+         {
+            Alert("Error when open order selection: ", nErrorCode);
+            FileWrite(hRecordFile, "Error when open order selection: ", nErrorCode);
+         }
+         if (nOpenResult == 2)
+         {
+            Alert("Error when open order repeat: ", nErrorCode);
+            FileWrite(hRecordFile, "Error when open order repeat: ", nErrorCode);
+         }
+         return (false);
+      default :
+         Alert("Error when open order: ", nErrorCode);
+         FileWrite(hRecordFile, "Error when open order: ", nErrorCode);
+         return (false);
+      }
+   }
+   return (true);
+}
